@@ -16,7 +16,7 @@ One of the most important parts of training ML models is for the experiments to 
 
 * Seed your random generators
 
-* Specify all the packages and their versions. This can be a `requirements.txt` file, a conda `env.yaml` file or a `pyproject.toml` file. If you want complete reproducibility, you can also include a `Dockerfile` to specify the environemnt to run the experiments in.
+* Specify all the packages and their versions. This can be a `requirements.txt` file, a conda `env.yaml` file or a `pyproject.toml` file. If you want complete reproducibility, you can also include a `Dockerfile` to specify the environment to run the experiments in.
 
 In this example, the checkpoint directory we create is of the following format:
 
@@ -118,7 +118,7 @@ python train_bert.py --checkpoint_dir ./experiments \
 
 ```
 
-The parameters are explained in more details in the doctstring of `train`.
+The parameters are explained in more details in the docstring of `train`.
 
 ---
 💡 **_Tip:_** If you have a GPU available, you can use it to considerably speedup your training. Simply set the `local_rank` to the GPU you want to run it on. Eg: for a single GPU machine this would look like
@@ -130,34 +130,105 @@ The parameters are explained in more details in the doctstring of `train`.
 
 ## 2. Integrating Deepspeed For More Efficient Training
 
+In this next section we'll add DeepSpeed to the model presented in Section 1 and turn on several features.
+
+## 2.0 Core DeepSpeed Code Changes
+
+Please see the [Writing DeepSpeed Models](https://www.deepspeed.ai/getting-started/#writing-deepspeed-models) instructions written on modifying an existing model to use DeepSpeed. Also we will heavily rely on the [DeepSpeed API documentation](https://deepspeed.readthedocs.io/en/latest/) and [config JSON documentation](https://www.deepspeed.ai/docs/config-json/) going forward.
+
+Please install DeepSpeed via `pip install deepspeed` if you haven't already done so, after installing you can check if your current version and other information via `ds_report`. For this tutorial we assume a DeepSpeed version of >= 0.5.4 and a torch version >= 1.6. Please upgrade via `pip install --upgrade deepspeed` if you are running an older version of DeepSpeed.
+
+### Add deepspeed.initialize + config
+
+Our first task is to identify where to add `deepspeed.initialize()` to the existing code in order to use the DeepSpeed training engine. Please see the [deepspeed.initialize API documentation](https://deepspeed.readthedocs.io/en/latest/initialize.html#training-initialization) for more details. This needs to be done after the model has been created and before the training loop has started. Most of our edits will be inside the `train` function inside [train_bert.py](./train_bert.py).
+
+After the model is created and before the optimizer is created we want to add the following lines:
+
+```python
+ds_config = {
+  "train_micro_batch_size_per_gpu": batch_size,
+  "optimizer": {
+      "type": "Adam",
+      "params": {
+          "lr": 1e-4
+      }
+  },
+}
+model, _, _, _ = deepspeed.initialize(model=model, 
+                                      model_parameters=model.parameters(), 
+                                      config=ds_config)
+```
+
+This will create the DeepSpeed training engine based on the previously instantiated model and the new `ds_config` dictionary. We can now also remove the previous lines of code that created an Adam optimizer, this will now be done via the DeepSpeed engine. It should be noted, you can optionally created your own optimizer and pass it into `deepspeed.initialize` however DeepSpeed is able to make further performance optimizations by instantiating its own optimizers.
+
+### Update the training-loop
+
+Next we want to update our training-loop to use the new model engine with the following changes:
+
+* `optimizer.zero_grad()` can be removed
+  * The DeepSpeed engine will do this for you at the right time.
+* Replace `loss.backward()` with `model.backward(loss)`
+  * There are several cases where the engine will properly scale the loss when using certain features (e.g., fp16, gradient-accumulation).
+* Replace `optimizer.step()` with `model.step()`
+  * The optimizer step is handled by the engine now and is responsible for dispatching to the right optimizer depending on certain features.
+
+### Update checkpoint save and load
+
+Immediately after our new `deepspeed.initialize` you will see a checkpoint load and in the training-loop you will see a few checkpoint save calls. DeepSpeed handles the complexities of checkpoint saving for you so we can simplify these codepaths in the following way. Please refer to the [model checkpoint API documentation](https://deepspeed.readthedocs.io/en/latest/model-checkpointing.html) for more details.
+
+__Checkpoint saving__: DeepSpeed will construct and save the state_dict for you, we can replace the *two* checkpoint saving snippets (i.e., `state_dict` construction and `torch.save`)  and replace them with the snippet below. The `client_state` being passed in here is an example of state outside the view of DeepSpeed that will be saved with the checkpoint.
+
+```python
+model.save_checkpoint(save_dir=exp_dir, client_state={'checkpoint_step': step})
+```
+
+__Checkpoint loading__: The checkpoint loading is happening right before the training-loop starts. It invokes the `load_model_checkpoint` function which consists of around 30 lines of code. We can replace the `load_model_checkpoint(load_checkpoint_dir, model, optimizer)` call with the following snippet:
+
+```python
+_, client_state = model.load_checkpoint(load_dir=load_checkpoint_dir)
+checkpoint_step = client_state['checkpoint_step']
+```
+
+## 2.1 Launching training
+
+We are now ready to launch our training! As a convenience, DeepSpeed provides its own launcher that is seamlessly compatible with internal clusters at MSFT (e.g., ITP). You can now try running your model on your available GPU(s) with the command below. By default this will attempt to run data-parallel training across all available GPUs on the current machine + any external machines listed in your `/job/hostfile`. Please read [more details about the DeepSpeed launcher](https://www.deepspeed.ai/getting-started/#launching-deepspeed-training) on our website.
+
+```bash
+deepspeed train_bert.py --checkpoint_dir .
+```
+
+---
+📌 **Note:** If using the deepspeed launcher you should not pass the `--local_rank` explicitly. This will be done by the launcher in the same way as if you launched with `torch.distributed.launch` from PyTorch.
+
+---
+
+## 2.2 Mixed Precision Training (fp16)
+
+Now that we are setup to use the DeepSpeed engine with our model we can start trying out a few different features of DeepSpeed. One feature is mixed precision training that utilizes half precision (fp16) data types. If you want to learn more about how half precision training works please refer to [[3]](https://arxiv.org/pdf/1710.03740v3.pdf) Baidu and NVIDIA on the topic.
+
+## 2.3 Zero Redundancy Optimizer (ZeRO)
+
+
 
 ## References
 > <a id="1">[1]</a> 
-[Vaswani et. al. Attention is all you need. 
+[Vaswani et al. Attention is all you need. 
 In Proceedings of the 31st International Conference on Neural Information Processing Systems (NIPS'17)](https://arxiv.org/pdf/1706.03762.pdf)
 
 > <a id="2">[2]</a>
-[Devlin, Jacob et. al. BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (NAACL-HLT'19)](https://aclanthology.org/N19-1423.pdf)
+[J. Devlin et al. BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (NAACL-HLT'19)](https://aclanthology.org/N19-1423.pdf)
 
+> <a id="3">[3]</a>
+[P. Micikevicius et al. Mixed Precision Training (ICLR'18)](https://arxiv.org/pdf/1710.03740v3.pdf)
+
+> <a id="4">[4]></a>
+[S. Rajbhandari, J. Rasley, O. Ruwase, Y. He. ZeRO: memory optimizations toward training trillion parameter models. (SC‘20)](https://arxiv.org/pdf/1910.02054.pdf)
+
+> <a id="5">[5]</a>
+[J. Ren, S. Rajbhandari, R. Aminabadi, O. Ruwase, S. Yang, M. Zhang, D. Li, Y. He. ZeRO-Offload: Democratizing Billion-Scale Model Training. (ATC'21)](https://www.usenix.org/system/files/atc21-ren-jie.pdf)
 ---------
 
 ## Scratch pad (TODO Remove)
-good practices
-  * experiment directory saving training metadata
-  * pytests
-
-data
-  * what is masked LM
-  * what does the code do (link to code)
-
-model
-  * core params for transformer model (e.g., #layers, attn)
-
-how to run
-  * launching on CPU (slow) launch on single GPU (fast)
-  * different train params
-
-------
 
 deepspeed additions
   * deepspeed.init, training loop, ckpt changes
