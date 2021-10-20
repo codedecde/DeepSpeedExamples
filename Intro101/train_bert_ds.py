@@ -724,14 +724,15 @@ def train(
         h_dim=h_dim,
         dropout=dropout,
     )
-    model = model.to(device)
+    #model = model.to(device)
     logger.info("Model Creation Done")
     ################################
     ###### Create Optimizer #######
     ################################
-    logger.info("Creating Optimizer")
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    logger.info("Optimizer Creation Done")
+    #logger.info("Creating Optimizer")
+    #optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    #logger.info("Optimizer Creation Done")
+    deepspeed.runtime.utils.see_memory_usage("pre-init", force=True)
 
     ################################
     ###### Init DeepSpeed ##########
@@ -747,10 +748,10 @@ def train(
         "fp16": {
             "enabled": True
         },
-        "_zero_optimization": {
-            "stage": 1,
-            "offload_optimizer": {
-                "device": "none"
+        "zero_optimization": {
+            "stage": 3,
+            "_offload_optimizer": {
+                "device": "cpu"
             }
         }
     }
@@ -758,6 +759,7 @@ def train(
                                                   model_parameters=model.parameters(), 
                                                   config=ds_config)
 
+    deepspeed.runtime.utils.see_memory_usage("post-init", force=True)
     ################################
     #### Load Model checkpoint #####
     ################################
@@ -786,10 +788,10 @@ def train(
         # Optimizer Step
         model.step()
         losses.append(loss.item())
-        deepspeed.runtime.utils.see_memory_usage("step", force=True)
         if step % log_every == 0:
             logger.info("Loss: {0:.4f}".format(np.mean(losses)))
             summary_writer.add_scalar(f"Train/loss", np.mean(losses), step)
+            deepspeed.runtime.utils.see_memory_usage("step", force=True)
         if step % checkpoint_every == 0:
             model.save_checkpoint(save_dir=exp_dir, client_state={'checkpoint_step': step})
             logger.info(
