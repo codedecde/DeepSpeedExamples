@@ -204,9 +204,9 @@ deepspeed train_bert.py --checkpoint_dir .
 
 ## 2.2 Mixed Precision Training (fp16)
 
-Now that we are setup to use the DeepSpeed engine with our model we can start trying out a few different features of DeepSpeed. One feature is mixed precision training that utilizes half precision (fp16) data types for our model and optimizer states. If you want to learn more about how half precision training works please refer to Mixed Precision Training paper [[3]](https://arxiv.org/pdf/1710.03740v3.pdf) from Baidu and NVIDIA on the topic.
+Now that we are setup to use the DeepSpeed engine with our model we can start trying out a few different features of DeepSpeed. One feature is mixed precision training that utilizes half precision (floating-point 16 or fp16) data types. If you want to learn more about how mixed precision training works please refer to the Mixed Precision Training paper [[3]](https://arxiv.org/pdf/1710.03740v3.pdf) from Baidu and NVIDIA on the topic.
 
-To enable this mode in DeepSpeed we need to update our `ds_config` before the engine is created. Please see [fp16 training options](https://www.deepspeed.ai/docs/config-json/#fp16-training-options) in the config documentation for more information. We can go with the simple case here by adding the following to our `ds_config` dictionary:
+To enable this mode in DeepSpeed we need to update our `ds_config` before the engine is created. Please see [fp16 training options](https://www.deepspeed.ai/docs/config-json/#fp16-training-options) in the config documentation for more information. In our case let's simple enable it by adding the following to our `ds_config` dictionary:
 
 ```python
   "fp16": {
@@ -214,17 +214,51 @@ To enable this mode in DeepSpeed we need to update our `ds_config` before the en
   }
 ```
 
-If you are training with NVIDIA V100 or A100 GPUs they include tensor cores which in some cases can accelerate some computation by as much as 8x if certain conditions are met. One of the most important conditions is that your model parameters are stored as fp16. For more details on other conditions and tips to better utilize these cores please see this guide from NVIDIA on [Tips for Optimizing GPU Performance Using Tensor Cores](https://developer.nvidia.com/blog/optimizing-gpu-performance-tensor-cores/).
+The memory reduction by switching from fp32 to fp16 results in the *model parameters* using half the amount of GPU memory, however the overall GPU memory reduction is not as simple. Since fp16 has half the available bits as fp32 it is not able to represent the same expressiveness as fp32, which can result in numeric instabilities during training. We are able to get around these instabilities in most cases by keeping some states in fp16 and others remain in fp32 (see Section 3 in [[3]](https://arxiv.org/pdf/1710.03740v3.pdf) if you'd like to learn more).
+
+The primary reason to utilize fp16 training is due to *Tensor Cores*. If you are training with NVIDIA V100 or A100 GPUs they include Tensor Cores which in some cases can accelerate computation by as much as 8x if certain conditions are met. One of the most important conditions is that your model parameters are stored as fp16. For more details on other conditions and tips to better utilize these cores please see this guide from NVIDIA on [Tips for Optimizing GPU Performance Using Tensor Cores](https://developer.nvidia.com/blog/optimizing-gpu-performance-tensor-cores/).
 
 ---
-📌 **Note:** At the start of training you will probably see several log messages about loss scaling and overflows, this is normal. In order for for fp16 training to be numerically stable we utilize a common technique called "loss scaling" (similar to Section 3.2 in [[3]](https://arxiv.org/pdf/1710.03740v3.pdf)). This attempts to find a scaling value to mitigate gradient over/under-flows during training.
+📌 **Note:** At the start of training you will probably see several log messages about loss scaling and overflows, this is normal. In order for fp16 training to be numerically stable we utilize a common technique called "loss scaling" (similar to Section 3.2 in [[3]](https://arxiv.org/pdf/1710.03740v3.pdf)). This attempts to find a scaling value to mitigate gradient over/under-flows during training.
 
 ---
 
 ## 2.3 Zero Redundancy Optimizer (ZeRO)
 
+ZeRO leverages the aggregate computation and memory resources of data parallelism to reduce the memory and compute requirements of each device (GPU) used for model training. ZeRO reduces the memory consumption of each GPU by partitioning the various model training states (weights, gradients, and optimizer states) across the available devices (GPUs and CPUs) in the distributed training hardware. Concretely, ZeRO is being implemented as incremental stages of optimizations, where optimizations in earlier stages are available in the later stages. To deep dive into ZeRO, please see our three papers [[4](https://arxiv.org/pdf/1910.02054.pdf), [5](https://www.usenix.org/system/files/atc21-ren-jie.pdf), [6](https://arxiv.org/abs/2104.07857)] that explore different optimizations in this space. We will focus on two features of ZeRO here, ZeRO Stage 1 and ZeRO-Offload. For further information, please refer to our [tutorial deep diving ZeRO](https://www.deepspeed.ai/tutorials/zero/) and our [tutorial deep diving ZeRO Offload](https://www.deepspeed.ai/tutorials/zero-offload/) on our website.
 
+* ZeRO Stage 1: The optimizer states (e.g., for the Adam optimizer, 32-bit weights, and the first, and second moment estimates) are partitioned across the processes, so that each process updates only its partition.
+* ZeRO-Offload: Supports efficiently offloading optimizer memory and computation from the GPU to the host CPU. ZeRO-Offload enables large models with up to 13 billion parameters to be trained on a single GPU.
 
+To enable ZeRO Stage 1 in DeepSpeed we need to again update our `ds_config` before the engine is created. Please see [ZeRO optimizations](https://www.deepspeed.ai/docs/config-json/#zero-optimizations-for-fp16-training) in the DeepSpeed config documentation for more information. In our case let's simply enable stage 1 it by adding the following to our `ds_config` dictionary:
+
+```python
+  "zero_optimization": {
+    "stage": 1
+  }
+```
+
+We can re-run our training now with ZeRO stage 1 enabled and should see a per-GPU memory reduction as we scale up the total number of GPUs. Typically you can now use this extra GPU memory to either scale up your model size or scale up your per-GPU training batch size. However, if we only have 1 GPU available we probably want to enable ZeRO-Offload to allow us to train larger model sizes. Please update your `ds_config` to include the following:
+
+```python
+  "zero_optimization": {
+    "stage": 1,
+    "offload_optimizer": {
+      "device": "cpu"
+    }
+  }
+```
+
+This config will now allow us to train a much larger model than we were previously able to do. For example on a single P40 GPU with 24GB of memory we are unable to train a 2 billion parameter model (i.e., `--num_layers 24 --h_dim 4096`), however with ZeRO-Offload we now can!
+
+```bash
+deepspeed train_bert.py --checkpoint_dir . --num_layers 24 --h_dim 4096
+```
+
+---
+📌 **Note:** Earlier on when we setup `deepspeed.initialize` we chose not to explicitly pass an optimizer and instead let the DeepSpeed engine instantiate one for us. This is especially useful now that we are using ZeRO-Offload. DeepSpeed includes a highly optimized version of Adam that executes purely on CPU. This means that DeepSpeed will detect if you are using ZeRO-Offload w. Adam and switch to optimized CPUAdam variant.
+
+---
 
 ## References
 > <a id="1">[1]</a> 
@@ -242,21 +276,6 @@ In Proceedings of the 31st International Conference on Neural Information Proces
 
 > <a id="5">[5]</a>
 [J. Ren, S. Rajbhandari, R. Aminabadi, O. Ruwase, S. Yang, M. Zhang, D. Li, Y. He. ZeRO-Offload: Democratizing Billion-Scale Model Training. (ATC'21)](https://www.usenix.org/system/files/atc21-ren-jie.pdf)
----------
 
-## Scratch pad (TODO Remove)
-
-deepspeed additions
-  * deepspeed.init, training loop, ckpt changes
-
-launching across multiple GPUs
-
-fp16
-  * how to enable
-  * show memory reduction when enabled via nvidia-smi
-  * brief overview of how fp16 training works (e.g., loss scaling)
-
-zero
-  * introduce how zero reduces memory
-  * introduce zero offload
-  * update config to use z1 + offload to showcase a model that can only run with offload enabled
+> <a id="1">[6]</a> 
+[S. Rajbhandari, O. Ruwase, J. Rasley, S. Smith, Y. He. ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning (SC'21)](https://arxiv.org/abs/2104.07857)
