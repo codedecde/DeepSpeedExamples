@@ -204,9 +204,25 @@ deepspeed train_bert.py --checkpoint_dir .
 
 ## 2.2 Mixed Precision Training (fp16)
 
-Now that we are setup to use the DeepSpeed engine with our model we can start trying out a few different features of DeepSpeed. One feature is mixed precision training that utilizes half precision (fp16) data types. If you want to learn more about how half precision training works please refer to [[3]](https://arxiv.org/pdf/1710.03740v3.pdf) Baidu and NVIDIA on the topic.
+Now that we are setup to use the DeepSpeed engine with our model we can start trying out a few different features of DeepSpeed. One feature is mixed precision training that utilizes half precision (fp16) data types for our model and optimizer states. If you want to learn more about how half precision training works please refer to Mixed Precision Training paper [[3]](https://arxiv.org/pdf/1710.03740v3.pdf) from Baidu and NVIDIA on the topic.
+
+To enable this mode in DeepSpeed we need to update our `ds_config` before the engine is created. Please see [fp16 training options](https://www.deepspeed.ai/docs/config-json/#fp16-training-options) in the config documentation for more information. We can go with the simple case here by adding the following to our `ds_config` dictionary:
+
+```python
+  "fp16": {
+    "enabled": True
+  }
+```
+
+If you are training with NVIDIA V100 or A100 GPUs they include tensor cores which in some cases can accelerate some computation by as much as 8x if certain conditions are met. One of the most important conditions is that your model parameters are stored as fp16. For more details on other conditions and tips to better utilize these cores please see this guide from NVIDIA on [Tips for Optimizing GPU Performance Using Tensor Cores](https://developer.nvidia.com/blog/optimizing-gpu-performance-tensor-cores/).
+
+---
+📌 **Note:** At the start of training you will probably see several log messages about loss scaling and overflows, this is normal. In order for for fp16 training to be numerically stable we utilize a common technique called "loss scaling" (similar to Section 3.2 in [[3]](https://arxiv.org/pdf/1710.03740v3.pdf)). This attempts to find a scaling value to mitigate gradient over/under-flows during training.
+
+---
 
 ## 2.3 Zero Redundancy Optimizer (ZeRO)
+
 
 
 
